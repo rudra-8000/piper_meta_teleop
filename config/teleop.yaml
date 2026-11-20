@@ -113,6 +113,20 @@ leader_follower:
                                  # ctrl = leader's broadcast command frames (master mode 0xFA; stayed silent without a pendant)
                                  # msgs = leader's joint feedback (use if leader is in plain drag-teach)
 
+# ----- driving the robot from code: a trained policy / planner (piper_teleop/robot.py, docs/policy_control.md)
+robot:
+  arm: left                      # the physical arm a policy drives = the follower the dataset's state / action describe
+  control_hz: 200                # the background thread that streams commands to the arm (send_action only sets the target)
+  max_joint_speed: 2.0           # rad/s cap, all joints arrive together.  The teleop used 3.0 (leader_follower.max_joint_speed); a policy
+                                 #   you have not seen move yet gets a lower cap
+  sync_speed: 0.5                # rad/s for the FIRST target after connecting (like the teleop's start-up alignment)
+  rest_speed: 0.5                # rad/s for reset() / the fold-to-rest on exit
+  rest_deg: null                 # null = defaults.park_deg, the folded rest pose every recorded episode starts from
+  server_host: 127.0.0.1         # python -m piper_teleop.robot_server: 127.0.0.1 = this machine only; a network address needs --token
+  server_port: 8800
+  park_on_exit: true             # fold to rest when the program ends; the motors always stay ENABLED and holding
+  # gripper input layer (target + slow sine): leader_follower.gripper_slew_mm_s / _dither_mm / _dither_hz, same as the teleop
+
 # ----- dataset recording (python -m piper_teleop.record): LeRobot format, see docs/recording.md
 record:
   fps: 30

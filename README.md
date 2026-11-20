@@ -7,6 +7,8 @@ Teleoperation for two AgileX Piper arms, plain Python + CAN:
 | Quest 3 → both arms (headset on, or headless / controllers only) | `python -m piper_teleop.quest_server` |
 | Leader arm → follower arm (software) | `python -m piper_teleop.leader_follower` |
 | Record a LeRobot dataset (v3.0 / v2.1, 30 Hz) while teleoperating arm-to-arm | `python -m piper_teleop.record --root datasets/NAME` - see [docs/recording.md](docs/recording.md) |
+| Drive an arm from Python / run a trained policy or planner | `from piper_teleop.robot import PiperRobot`, or `python -m piper_teleop.run_policy --policy FILE.py:factory` - see [docs/policy_control.md](docs/policy_control.md) |
+| Network server in front of the arm + cameras, so any client can read / command it | `python -m piper_teleop.robot_server`, client `piper_teleop.robot_client` - see [docs/remote_control.md](docs/remote_control.md) |
 | Same, no hardware (simulated arms) | add `--sim` |
 
 Read the two PDFs in `docs/` first:
