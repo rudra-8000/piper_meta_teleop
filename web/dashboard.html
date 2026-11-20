@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Piper Teleop Dashboard</title>
+<style>
+  :root { --bg:#f4f6fa; --fg:#18202c; --mut:#667085; --card:#fff; --line:#d9dfe9; --ok:#17934a; --bad:#d92d20; --warn:#b54708; --acc:#1b6fe0; --arm1:#1b6fe0; --arm2:#c2410c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0e1218; --fg:#e8ecf3; --mut:#8a94a6; --card:#171c25; --line:#2a3240; --ok:#3ecf72; --bad:#ff6b5e; --warn:#f5a524; --acc:#5aa9ff; --arm1:#5aa9ff; --arm2:#ff9a5c; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--card); }
+  header h1 { font-size:18px; margin:0; margin-right:auto; }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  #estop { background:var(--bad); color:#fff; border-color:var(--bad); font-weight:700; padding:10px 22px; }
+  main { display:grid; grid-template-columns:repeat(auto-fit, minmax(340px, 1fr)); gap:14px; padding:14px 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+  h2 { margin:0 0 6px; font-size:15px; }
+  canvas { width:100%; height:220px; display:block; background:transparent; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-variant-numeric:tabular-nums; }
+  .kv span:nth-child(odd) { color:var(--mut); }
+  .pill { display:inline-block; padding:1px 9px; border-radius:99px; font-size:12px; border:1px solid var(--line); }
+  .engaged { color:var(--ok); border-color:var(--ok); } .estop { color:var(--bad); border-color:var(--bad); }
+  .homing, .parking { color:var(--warn); border-color:var(--warn); }
+  #toast { position:fixed; bottom:14px; left:50%; transform:translateX(-50%); background:var(--fg); color:var(--bg); padding:8px 16px; border-radius:8px; opacity:0; transition:opacity .2s; pointer-events:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Piper Teleop</h1>
+  <span id="conn" class="pill">connecting</span>
+  <button data-cmd="calibrate" title="Guided: push the controllers forward, right, up">Calibrate axes</button>
+  <button data-cmd="calibrate_cancel" title="Cancel the calibration, or skip it and let the arms move">Skip / cancel calibration</button>
+  <button data-cmd="home">Home</button>
+  <button data-cmd="park">Park</button>
+  <button data-cmd="resume">Resume</button>
+  <button id="estop">FREEZE ARMS (space)</button>
+</header>
+<main>
+  <section class="card" id="calcard" style="grid-column:1/-1;display:none"><h2>Axis calibration <span class="pill" id="calpill"></span></h2>
+    <div id="caltext" style="font-size:22px;font-weight:600;margin:4px 0 8px"></div><div class="kv" id="calres"></div></section>
+  <section class="card" style="grid-column:1/-1"><h2>Quest headset <span class="pill" id="qpill">?</span></h2>
+    <div id="hint" style="font-weight:600;margin:2px 0 8px"></div><div class="kv" id="quest"></div></section>
+  <section class="card"><h2>Network &amp; loop</h2><div class="kv" id="sys"></div></section>
+  <section id="arms"></section>
+</main>
+<div id="toast"></div>
+<script>
+const $ = (s) => document.querySelector(s);
+const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+const armsEl = $('#arms');
+armsEl.style.display = 'contents';
+const cards = {};
+function toast(t) { const e = $('#toast'); e.textContent = t; e.style.opacity = 1; setTimeout(() => e.style.opacity = 0, 2200); }
+ws.onopen = () => { ws.send(JSON.stringify({ t: 'hello', role: 'viewer' })); $('#conn').textContent = 'connected'; };
+ws.onclose = () => { $('#conn').textContent = 'disconnected'; };
+const send = (cmd) => ws.send(JSON.stringify({ t: 'cmd', cmd }));
+document.querySelectorAll('[data-cmd]').forEach((b) => b.onclick = () => send(b.dataset.cmd));
+$('#estop').onclick = () => send('estop');
+// Space = freeze. Also stop the browser from "clicking" whichever button has focus (keyup activates it),
+// otherwise Space could freeze the arms and then fire Home.
+addEventListener('keydown', (e) => { if (e.code === 'Space') { e.preventDefault(); if (document.activeElement) document.activeElement.blur(); if (!e.repeat) send('estop'); } });
+addEventListener('keyup', (e) => { if (e.code === 'Space') e.preventDefault(); });
+
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function draw(cv, pts, ax, ay, color, title, lim) {
+  const dpr = devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  const [x0, x1, y0, y1] = lim;
+  const sx = (v) => 10 + (v - x0) / (x1 - x0) * (w - 20), sy = (v) => h - 18 - (v - y0) / (y1 - y0) * (h - 30);
+  g.strokeStyle = css('--line'); g.lineWidth = 1; g.beginPath(); g.moveTo(sx(0), 0); g.lineTo(sx(0), h); g.moveTo(0, sy(0)); g.lineTo(w, sy(0)); g.stroke();
+  g.fillStyle = css('--mut'); g.font = '11px system-ui'; g.fillText(title, 8, 12);
+  g.strokeStyle = color; g.lineWidth = 5; g.lineCap = 'round'; g.lineJoin = 'round';
+  g.beginPath(); pts.forEach((p, i) => { const X = sx(p[ax]), Y = sy(p[ay]); i ? g.lineTo(X, Y) : g.moveTo(X, Y); }); g.stroke();
+  g.fillStyle = css('--fg'); pts.forEach((p, i) => { g.beginPath(); g.arc(sx(p[ax]), sy(p[ay]), i === pts.length - 1 ? 5 : 3, 0, 7); g.fill(); });
+}
+function card(name) {
+  if (cards[name]) return cards[name];
+  const s = document.createElement('section'); s.className = 'card';
+  s.innerHTML = `<h2>${name} arm <span class="pill" data-k="state"></span></h2>
+    <canvas data-k="side"></canvas><canvas data-k="top"></canvas><div class="kv" data-k="kv"></div>`;
+  armsEl.appendChild(s); return (cards[name] = s);
+}
+const kv = (o) => Object.entries(o).map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join('');
+ws.onmessage = (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.t === 'speak') { return; }
+  if (m.t === 'event' && (m.kind === 'speak' || m.kind === 'haptic')) { return; }
+  if (m.t === 'event') { toast(`event: ${m.kind} ${(m.args || []).join(' ')}`); return; }
+  if (m.t !== 'status') return;
+  const n = m.net || {};
+  $('#sys').innerHTML = kv({
+    'control loop': `${m.loop_hz} Hz (worst step ${m.step_ms_max} ms, overruns ${m.overruns})`,
+    'pose stream': `${n.pose_hz} Hz, worst gap ${n.max_gap_ms} ms, age ${n.stream_age_ms ?? '-'} ms`,
+    'Quest RTT': n.rtt_ms == null ? '-' : n.rtt_ms.toFixed(1) + ' ms',
+    'clients': (n.clients || []).join(', ') || '-',
+    'heading offset': m.frame_yaw_deg + '°', 'error': m.error || 'none' });
+  // ---- axis calibration card
+  const cal = m.calibration, cc = $('#calcard');
+  if (m.calibration_required && !(cal && cal.active)) {
+    cc.style.display = '';
+    $('#calpill').textContent = 'required'; $('#calpill').className = 'pill homing';
+    $('#caltext').textContent = 'The arms are frozen until the axes are calibrated. Hold both controllers in front of you (the calibration then starts by itself), or press "Skip / cancel calibration" to move the arms without it.';
+    $('#calres').innerHTML = '';
+  } else if (cal && (cal.active || cal.status === 'done' || cal.status === 'failed')) {
+    cc.style.display = '';
+    const names = ['FORWARD', 'RIGHT', 'UP'];
+    $('#calpill').textContent = cal.active ? `step ${cal.step + 1} of ${cal.of}: ${names[cal.step] || ''} (${cal.phase === 'record' ? 'recording' : 'waiting for GRIP'})` : cal.status;
+    $('#calpill').className = 'pill ' + (cal.status === 'done' ? 'engaged' : cal.active ? 'homing' : 'estop');
+    $('#caltext').textContent = cal.msg;
+    const r = cal.result || {};
+    $('#calres').innerHTML = cal.status === 'done' ? kv({ 'heading offset': r.yaw_deg + '\u00b0', 'forward vs right': 'axes agree within ' + r.axis_error_deg + '\u00b0', 'up tilt': r.up_tilt_deg + '\u00b0' }) : '';
+  } else cc.style.display = 'none';
+  // ---- Quest headset: what the page says + a plain-language diagnosis of "no controller data"
+  const qs = n.quest || [], x = qs[0], port = location.port || '8788';
+  let hint, ok = false;
+  if (!x) hint = `The Quest page is not connected to this PC. Wake the headset (put it on), open Quest Browser at http://localhost:${port} (scripts/quest_adb.sh usb, or start the server with --usb), then press "Enter VR". (A headset that is not on your head falls asleep within seconds and drops the connection: wear it, or run scripts/quest_adb.sh headless-on.)`;
+  else if (x.state === 'error') hint = 'The headset page reports an error: ' + x.msg;
+  else if (x.state === 'unavailable') hint = x.msg;
+  else if (x.state !== 'running') hint = `The page is open (${x.state}) but no VR session is running. In the headset, press "Enter VR & start streaming" with the controller ray.`;
+  else if (x.fps === 0) hint = `A VR session exists but the browser is delivering NO frames (visibility: ${x.vis || '?'}) - black screen. A system menu/dialog may be covering the app (press the Oculus button / dismiss it), or the session is stuck: exit VR and press Enter VR again.`;
+  else if (!x.tracked || x.tracked === 'none') hint = 'VR session is running but no controller is tracked. Pick up the controllers (not hand tracking), press a button to wake them, keep them in front of the headset.';
+  else if (!(n.pose_hz > 5)) hint = 'Controllers are tracked but no packets are arriving - check the PC link on the page.';
+  else { hint = 'Streaming OK.'; ok = true; }
+  const hl = m.headless;
+  if (x && x.mode === 'headless') {
+    if (hl && hl.note) hint = 'HEADLESS: ' + hl.note + '  |  ' + hint;
+    else if (x.state === 'ended') hint = 'The VR session ended while in headless mode (the headset was probably treated as removed). Wear it, press Enter VR again; the proximity override is armed automatically once the session runs.';
+  }
+  $('#hint').textContent = hint;
+  $('#hint').style.color = ok ? css('--ok') : css('--warn');
+  $('#qpill').textContent = !x ? 'not connected' : (x.state || '?'); $('#qpill').className = 'pill ' + (ok ? 'engaged' : 'homing');
+  $('#quest').innerHTML = kv(x ? {
+    'page': 'connected', 'XR session': `${x.state}${x.msg ? ' - ' + x.msg : ''}`,
+    'controllers tracked': x.tracked || '-', 'headset visibility': x.vis || '-',
+    'headless override': x && x.mode === 'headless' ? (hl ? (hl.ok ? 'ON - the headset treats itself as worn' : 'NOT ACTIVE') + (hl.foreground ? ' (in front: ' + hl.foreground.split('.').pop() + ')' : '') : 'waiting for the VR session to run') : 'off (headset mode)',
+    'frames/s | packets/s': `${x.fps ?? '-'} | ${x.sent ?? '-'}   (display: ${x.blend || '-'})`,
+    'live GRIP / TRIGGER': Object.entries(m.hands || {}).map(([h, v]) => `${h}: grip ${v.squeeze.toFixed(2)} trigger ${v.trigger.toFixed(2)}${v.tracked ? '' : ' UNTRACKED'}${v.emulated ? ' EMULATED' : ''} (${v.age_ms} ms ago)`).join('   ') || 'no packets yet',
+    'input sources': (x.inputs || []).map((i) => `${i.h || '?'} ${i.p || ''}${i.g ? ' (gamepad)' : ''}${i.hand ? ' (HAND tracking - no buttons)' : ''}`).join('; ') || 'none' } : { 'page': 'not connected' });
+  Object.entries(m.arms).forEach(([name, a], i) => {
+    const c = card(name), col = css(i ? '--arm2' : '--arm1');
+    const pill = c.querySelector('[data-k=state]'); pill.textContent = a.state; pill.className = 'pill ' + a.state;
+    draw(c.querySelector('[data-k=side]'), a.pts, 0, 2, col, 'side view (x forward →, z up)', [-0.35, 0.6, -0.05, 0.55]);
+    draw(c.querySelector('[data-k=top]'), a.pts, 0, 1, col, 'top view (x forward →, y left ↑)', [-0.35, 0.6, -0.4, 0.4]);
+    c.querySelector('[data-k=kv]').innerHTML = kv({
+      'status': a.msg + (a.fine ? ' [fine]' : ''), 'hand': a.hand,
+      'TCP (m)': a.tcp.map((v) => v.toFixed(3)).join(', '),
+      'joints (deg)': a.q.map((v) => (v * 57.2958).toFixed(0)).join(', '),
+      'gripper cmd / measured (mm)': `${(a.grip * 1000).toFixed(0)} / ${((a.grip_meas ?? 0) * 1000).toFixed(0)}`,
+      ...(a.grip_warn ? { 'GRIPPER WARNING': a.grip_warn } : {}), 'IK error': a.pos_err_mm + ' mm' });
+  });
+};
+</script>
+</body>
+</html>

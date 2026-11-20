@@ -1,0 +1,151 @@
+# Piper teleop configuration.  Every key here is optional; see docs for details.
+
+transport:
+  host: 0.0.0.0          # listen on all interfaces (USB adb-reverse and Wi-Fi)
+  port: 8788
+  tls_cert: certs/cert.pem   # used only with --tls (scripts/make_cert.sh creates these)
+  tls_key: certs/key.pem
+
+control:
+  rate_hz: 200           # control loop; Piper accepts joint commands at up to ~200 Hz
+  frame_yaw_deg: 0.0     # initial heading offset; normally set live with the calibrate gesture
+  estop_mode: freeze     # freeze   = SPACE holds every joint where it is (software; never cuts power)  [default]
+                         # firmware = ALSO send the arm's fast-stop command (behaviour unverified on your arms)
+
+calibration:
+  auto: true             # when both controllers are first tracked, run the guided forward/right/up calibration
+                         # (both thumbsticks cancel it; or run it any time: dashboard button, console 'c', both sticks)
+
+piper:                   # applies to real arms only
+  driver: pyagxarm       # pyagxarm = AgileX's current library (github.com/agilexrobotics/pyAgxArm)  [default]
+                         # piper_sdk = the older piper_sdk V3 interface (what this project used first)
+  firmware: auto         # pyagxarm only: auto = ask the arm; or v189 / v188 / v183 / default
+  speed_pct: 100         # MotionCtrl_2 speed ratio. 100 = let *our* speed limit decide
+  follow_mode: standard  # standard | high_follow
+                         #   high_follow (0xAD) bypasses the arm's own trajectory smoothing =
+                         #   lowest latency, but the arm will chase targets as hard as it can.
+                         #   Try it only after standard mode works, at low max_joint_speed.
+  gripper_effort: 1000   # 0.001 N*m units, 0..5000.  Start low.  (grippers start OPEN; TRIGGER closes, release opens)
+  dh_is_offset: 1        # 1 = firmware >= S-V1.6-3 (new arms).  0 only for very old firmware.
+  judge_flag: true       # SDK checks the CAN interface is really up
+
+# Defaults applied to every arm; override per arm below.
+defaults:
+  pos_scale: 0.8         # hand motion -> TCP motion (normal = 2x fine: 0.8 vs 0.4)
+  rot_scale: 0.8
+  fine_factor: 0.5       # A/X toggles this multiplier ("precision mode"): fine = 0.8 * 0.5 = 0.4 (unchanged)
+  max_joint_speed: 2.0   # rad/s while teleoperating (arm hardware max is ~3.1-3.9 rad/s)
+  max_tcp_speed: 0.5     # m/s cap on the TOOL-TIP speed (a stretched arm at the joint cap moves its tip > 1 m/s). 0 = off
+  slow_zone_z: 0.12      # below this tip height (desk / peg work) ...
+  slow_zone_speed: 0.25  # ... the tip-speed cap is this (m/s). 0 = off
+  home_speed: 0.5        # rad/s for homing / parking
+  # --- wrist twist control (see the user guide, 'Arms twist a lot')
+  rot_axis_scale: [0.5, 1.0, 0.3]      # hand rotation -> gripper rotation gains: roll, pitch, yaw. Yaw/roll are expensive for a Piper wrist
+  wrist_pitch_min_deg: 20              # J5 never goes below this: near 0 the wrist axes J4/J6 line up and spin against each other
+  wrist_posture_weight: [0.3, 0.05, 0.3]  # gentle pull of J4/J5/J6 toward the home values. 0 = off; higher = calmer wrist, less exact gripper orientation
+  orientation_mode: follow_base   # follow_base = gripper heading follows the arm's swing around its base (sideways motion
+                         #   needs only J1);  world = gripper keeps the hand's WORLD orientation (wrist must counter-rotate)
+  smoothing_ms: 3        # joint-space lag.  Lower = snappier, 0 = off (jittery)
+  stale_ms: 150          # controller stream older than this -> arm holds
+  # --- gripper input layer (piper_teleop/gripper_layer.py): the trigger sets a TARGET; the raw gripper command is the
+  #     target + a slow sine.  Measured: without the sine only 2/9 held targets were reached, with it 27/27 (3 runs).
+  gripper_slew_mm_s: 0   # optional ramp toward the target, mm/s. 0 = none: fastest (~0.25 s) AND most reliable with the
+                         #   sine on; 150 took ~0.5 s; 300/600 occasionally failed. Raise only for gentler closing.
+  gripper_dither_mm: 0.5 # sine amplitude: 0.25 already worked, 0.5 = no measurable finger jiggle, 1.0 jiggles ~0.5 mm
+  gripper_dither_hz: 6.0 # sine frequency: 6 = fastest that stayed perfect (27/27); 10-15 unreliable; 25+ fails
+  gripper_enabled: true  # false = send NO gripper commands at all and show no gripper warnings (use while a gripper is out of order;
+                         #   the grippers on the first two real arms hold torque but ignore position targets - see the setup guide)
+  tcp_offset: [0.0, 0.0, 0.12]   # metres from flange to the tip of the gripper. MEASURE YOURS.
+  workspace:             # TCP box in the arm's own base frame (x fwd, y left, z up), metres.  Deliberately open: only the
+    x: [0.05, 1.0]       #   REAR plane (x_min) and each arm's OPERATOR side (set per arm below) are limited; the arm's own
+    y: [-1.0, 1.0]       #   reach (IK) still stops it.  NOTE: nothing here keeps the two arms apart (85 cm apart, facing).
+    z: [0.035, 1.0]      #   z_min (3.5 cm) keeps the tool tip off the desk (also enforced on the solved pose, not only the target).
+  # Start pose = folded rest pose, TCP raised 10 cm and 5 cm forward, tool 15 deg further down than at rest
+  home_deg: [0, 35, -34, -4, 37, 10]
+  park_deg: [0, 0, 0, 0, 0, 0]   # folded zero pose
+  filter_min_cutoff: 5.0 # Hz, smoothing of a slow/still hand. Higher = less lag, a little more jitter
+  filter_beta: 60.0      # cutoff rise with hand speed. Higher = less lag while moving
+  filter_rot_beta: 3.0   # same, for hand rotation
+
+# base_yaw_deg = direction of the arm's forward (x) axis in the OPERATOR frame, counter-clockwise, degrees.
+# Operator frame: forward = the way you face (set by the "click both sticks" calibration), left = your left.
+#   arms side by side, both facing forward ........ 0 / 0
+#   ALOHA style, arms facing each other, you at the table's long side, left arm on your left:
+#                                                    left: -90   right: +90   (swap if it moves the wrong way)
+# Which CAN interface is which PHYSICAL arm.  The names come from the USB port an adapter is plugged into, not from the arm it
+# is wired to - since the 2026-10-28 hub reconnect the LEFT arm's adapter is `can_right` and the RIGHT arm's is `can_left`.
+# Everything below (arms, leader/follower, recording) says left / right = the physical arm and is resolved here.  If the
+# adapters ever swap again, or you fix the udev rule (config/can_ports.conf), change ONLY these two lines.
+hardware:
+  can: {left: can_right, right: can_left}
+
+arms:
+  left:
+    backend: piper       # piper | sim
+    can: left            # the physical left arm's bus (hardware.can above)
+    hand: left           # left Touch controller drives this arm
+    base_yaw_deg: -90    # facing arms, 85 cm apart, you at the long side: left arm faces your right
+    workspace: {y: [-0.30, 1.0]}   # operator side of the left arm is -y (its right); +y is free
+  right:
+    backend: piper
+    can: right
+    hand: right
+    base_yaw_deg: 90
+    workspace: {y: [-1.0, 0.30]}   # operator side of the right arm is +y (its left); -y is free
+
+# ----- leader/follower (software) mode: see piper_teleop/leader_follower.py
+leader_follower:
+  leader_arm: right              # the physical arm you move by hand (CAN interface: hardware.can)
+  follower_arm: left             # the physical arm that copies it
+  mode: copy                     # copy = both arms mounted facing the same way (the leader's base mount is turned 180 deg by hand)
+  j1_offset_deg: 0.0             # base trim.  (a 180 software flip loses the 60 deg sector ahead of the follower; turn the mount instead)
+  rate_hz: 200
+  max_joint_speed: 3.0           # rad/s cap on the follower
+  gripper_unstick: false         # true = a gripper pushing at its effort limit without moving ~0.25 s relaxes 0.2 s, then retries.
+                                 # OFF: that is also what GRIPPING an object looks like, and relaxing would drop it
+  gripper_scale: 1.0             # leader gripper/pendant opening -> follower opening (used only if leader_gripper_mm is unset)
+  leader_gripper_mm: [16.0, 105.5]   # leader pendant (closed, fully open) in mm -> follower 0..70 mm.  Measured: 16 .. 105.5
+                                 # (the status line prints the range seen; adjust if the follower never fully closes/opens)
+  gripper_slew_mm_s: 0           # follower gripper input layer, same as defaults.gripper_* (target + slow sine)
+  gripper_dither_mm: 0.5
+  gripper_dither_hz: 6.0
+  leader_source: msgs            # msgs = the leader arm's own joint feedback, arm in normal mode + drag-teach (teach button)
+                                 # ctrl = leader's broadcast command frames (master mode 0xFA; stayed silent without a pendant)
+                                 # msgs = leader's joint feedback (use if leader is in plain drag-teach)
+
+# ----- dataset recording (python -m piper_teleop.record): LeRobot format, see docs/recording.md
+record:
+  fps: 30
+  format: v3.0                   # v3.0 (current LeRobot) | v2.1 (OpenPI and older LeRobot)
+  task: "teleoperated demonstration"
+  robot_type: piper
+  episode_time_s: 0              # 0 = an episode ends when you press a key; > 0 = it ends by itself after this long
+  reset_time_s: 0                # 0 = wait for Enter between episodes; > 0 = the next one starts by itself after this long
+  # Homing before EVERY episode (including the first, and after a retake): the follower drives to `deg` at `speed` and waits there,
+  # ignoring the leader; it follows again once YOU have put the leader (a hand-driven arm - software can't move it) within
+  # `tol_deg` of the same pose.  Episodes then all start from the same pose.  deg is in FOLLOWER joint space (after the joint
+  # mapping); null = the folded REST pose defaults.park_deg (the leader simply rests there, so it is easy to match - the raised
+  # defaults.home_deg pose is hard to hit by hand).  Off: enabled: false, or --no-home on the command line.
+  home: {enabled: true, deg: null, tol_deg: 10, speed: 0.5}
+  video: {codec: libx264, crf: 20, gop: 2}   # h264 decodes everywhere; gop 2 = cheap random access; crf 20 = visually clean (lower = bigger files)
+  # name = the observation.images.<name> key.  Names follow the physical arm: the camera on the LEFT arm is cam_left_wrist.
+  cameras:
+    # settings: the camera's own colour controls (tools/orbbec_stream.py): auto_exposure, exposure (units of 100 us), gain 0..100,
+    # auto_white_balance, white_balance (K), hue, ae_priority.  Anything not listed starts from: auto exposure + auto white balance +
+    # constant frame rate.  FIXED exposure + gain because auto exposure was unstable (the same scene came out at brightness 112 in one
+    # run and 188-217 with 30-45 % of the pixels blown out in the next, and it shifts as the arm moves); white balance stays AUTO
+    # because it measured neutral every time while fixed values gave a cyan cast.  200 = 20 ms = a multiple of the 10 ms mains
+    # flicker period, so no banding.  Re-tune whenever the lighting changes:  python tools/camera_tune.py --serial SERIAL --out DIR
+    cam_high:       {type: orbbec, serial: CC1365303LL, width: 640, height: 480, fps: 30, settings: {exposure: 200, gain: 40}}   # top / front view
+    cam_left_wrist: &left_wrist {type: orbbec, serial: CC1WC5200WW, width: 640, height: 480, fps: 30, settings: {exposure: 200, gain: 50}}   # on the LEFT arm (follower)
+  #  cam_right_wrist: {type: opencv, index: 0, width: 640, height: 480, fps: 30}            # any UVC webcam, e.g. on the right arm
+  # Alternative camera sets, chosen with  --cameras NAME  (the plain `cameras:` above is the default).  Same feature names, so the
+  # datasets have the same keys; only what cam_high looks through changes.
+  camera_sets:
+    # The ASUS Xtion (PrimeSense, USB 1d27:0601) as the top / front camera instead of the Orbbec CC1365303LL; the left wrist camera is
+    # unchanged.  The Xtion is colour-only here (no depth), opened through OpenNI2 (tools/xtion_stream.py).  Exposure / white balance
+    # are left on the Xtion's own auto: nothing in `settings:` has been tuned for it yet (it accepts auto_exposure, exposure, gain,
+    # auto_white_balance, and the software rgb_gain).
+    xtion_top:
+      cam_high:       {type: xtion, width: 640, height: 480, fps: 30}
+      cam_left_wrist: *left_wrist

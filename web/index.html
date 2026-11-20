@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Piper Quest Teleop</title>
+<style>
+  :root { --bg:#101319; --fg:#e8ecf3; --mut:#8a94a6; --ok:#3ecf72; --bad:#ff5d5d; --card:#1a1f29; --acc:#4da3ff; }
+  body { margin:0; font:18px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:720px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  .card { background:var(--card); border-radius:14px; padding:16px 18px; margin:14px 0; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:3px 0; }
+  .mut { color:var(--mut); }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  #start.big { font-size:28px; padding:30px 22px; margin:18px 0 6px; background:var(--ok); color:#04170b; }
+  button { font:inherit; padding:16px 22px; border-radius:12px; border:0; background:var(--acc); color:#04121f; font-weight:700; width:100%; }
+  button:disabled { opacity:.4; }
+  #estop { background:var(--bad); color:#fff; margin-top:10px; }
+  label { display:flex; gap:10px; align-items:center; padding:6px 0; }
+  input[type=checkbox] { width:22px; height:22px; }
+  pre { margin:0; white-space:pre-wrap; font:15px/1.4 ui-monospace, monospace; }
+  ul { margin:6px 0 0 18px; padding:0; } li { margin:2px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Piper Quest Teleop</h1>
+  <div class="mut">Two-arm teleoperation from the Quest 3 controllers.</div>
+
+  <button id="start" class="big" disabled>Enter VR &amp; start streaming</button>
+  <div class="mut" style="margin-bottom:6px"><b>Press this first.</b> The PC only sees your controllers while a VR session is running - until then it says "no controller data". Hold both controllers (not your hands), then press it with the controller ray.</div>
+
+  <div class="card">
+    <div class="row"><span class="mut">WebXR</span><span id="xrstate">checking...</span></div>
+    <div class="row"><span class="mut">PC link</span><span id="net" class="bad">connecting...</span></div>
+    <div class="row"><span class="mut">Round-trip</span><span id="rtt">-</span></div>
+    <div class="row"><span class="mut">Controllers</span><span id="hands">-</span></div>
+  </div>
+
+  <div class="card">
+    <label><input type="checkbox" id="passthrough"> Passthrough (see the real robot while in VR)</label>
+    <label><input type="checkbox" id="headless"> Headless mode (I will take the headset off - screen stays dark)</label>
+    <button id="estop">FREEZE ARMS</button>
+    <div class="mut" id="log" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card"><pre id="arms">(waiting for PC)</pre></div>
+
+  <div class="card">
+    <b>Controls</b>
+    <ul>
+      <li><b>Hold GRIP</b> - arm follows that hand (release = arm holds)</li>
+      <li><b>TRIGGER</b> - gripper (squeeze = close)</li>
+      <li><b>A / X</b> - fine (slow) mode on/off</li>
+      <li><b>B / Y</b> - send that arm home (when GRIP not held)</li>
+      <li><b>Click both sticks</b> - set "forward" to where the controllers point</li>
+    </ul>
+    <div class="mut" style="margin-top:8px">Haptics: short tick = engaged, soft buzz = at reach limit, long buzz = frozen / error.</div>
+  </div>
+</main>
+<script src="/quest.js"></script>
+</body>
+</html>

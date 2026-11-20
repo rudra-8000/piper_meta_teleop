@@ -1,0 +1,6 @@
+# NAME      USB_PORT   (get USB_PORT from: scripts/can_setup.sh list)
+can_left    1-2:1.0
+can_right   1-4:1.0
+# leader/follower mode (arm-to-arm) - uncomment and replace the two lines above if you are only doing that:
+# can_leader    1-2:1.0
+# can_follower  1-4:1.0

@@ -1,0 +1,11 @@
+.venv/
+certs/
+__pycache__/
+*.pyc
+.pytest_cache/
+config/can_ports.conf
+logs/
+.venv_cam/
+datasets/
+Log/
+*.exe

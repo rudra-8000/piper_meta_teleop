@@ -1,0 +1,17 @@
+# Runtime
+numpy>=1.26
+PyYAML>=6
+websockets>=13
+python-can>=4.3
+# AgileX Piper SDK. PyPI 0.6.2 has no C_PiperInterface_V3 (needed for firmware >= 1.8-8);
+# the GitHub master (0.7.0a1) does, and falls back to V2 for older firmware.
+piper_sdk @ git+https://github.com/agilexrobotics/piper_sdk.git      # fallback driver + diagnostics tools
+# AgileX's current library, the default driver (pinned to the commit this was developed against)
+pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git@d90e234ba8e408cfa964b38aa9120b3131fc9f85
+# Dataset recording (LeRobot v2.1 / v3.0 writer: no torch or lerobot needed)
+pyarrow>=15
+av>=12
+opencv-python-headless>=4.8
+# Docs + tests
+reportlab>=4
+pytest>=8

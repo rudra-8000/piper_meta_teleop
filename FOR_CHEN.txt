@@ -1,0 +1,8 @@
+FOR TELEOP ONLY:
+.venv/bin/python -m piper_teleop.leader_follower --yes
+
+to end press ctrl+C
+
+============================
+
+.venv/bin/python -m piper_teleop.record --root datasets/clear_table --cameras xtion_top --task "clear the table" --num-episodes 40 --yes --format v2.1

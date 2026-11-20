@@ -1,0 +1,9 @@
+# Time-limited joint locks (see piper_teleop/joint_lock.py).  While a lock is active, ONLY gripper and read-only query
+# frames are sent to that arm by any program in this project; everything else (joint, mode, enable/disable, reset,
+# e-stop) is refused.  Local time.  Delete the entry (or let it expire) to unlock.
+can_left:
+  until: "2026-10-28 13:00"
+  reason: "user request 2026-10-27: right arm off; left arm gripper-only, no body joint may move"
+  # user-approved 2026-10-27 21:15: let the 0x151 mode frame (STANDBY/CAN only) through, but ONLY while all six joint
+  # motors report DISABLED (enable frames stay blocked), to test whether the gripper needs CAN control mode.
+  allow_mode_frame_when_joints_disabled: true
