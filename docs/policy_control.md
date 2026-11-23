@@ -20,6 +20,7 @@ Quest, no leader arm. It drives ONE arm (by default the physical **left** arm, t
 |---|---|
 | `obs["observation.state"]` | (7,) float32: follower joints 1..6 [rad], gripper opening 0..1 (1 = open, 70 mm) |
 | `obs["observation.images.<cam>"]` | (H, W, 3) uint8 RGB, one per camera of `record.cameras` (or the `camera_sets` entry you pass) |
+| `obs["frame_age_s"]`, `obs["state_age_s"]` | not model inputs: seconds since each camera frame / the arm feedback was captured (check them for staleness; skip these keys when you loop over `obs`) |
 | action | (7,) absolute joint targets [rad] + gripper target 0..1: what the dataset's `action` holds |
 
 A policy trained on a dataset from `piper_teleop.record` therefore needs no conversion. Use the **same camera set** you recorded
@@ -93,6 +94,15 @@ A LeRobot policy (ACT, Diffusion, ...) in ten lines, **not tested here** (no pol
 OpenPI: run its policy server and call it from the factory (`openpi_client`'s `WebsocketClientPolicy(host, port).infer(...)["actions"]`
 returns an (N, 7) chunk); build the observation dict the way your OpenPI data config expects. A high-level planner or LLM agent is
 the same idea: any callable that turns `obs` into an action, or skip the script and call `send_tcp_pose` yourself.
+
+## Command freshness and speed policy (optional settings)
+
+* `command_ttl_s` (`PiperRobot(command_ttl_s=...)` / `robot.command_ttl_s`; off by default): a target older than this is replaced by
+  "hold where commanded now". A policy loop that hangs or crashes then stops the arm instead of leaving it creeping toward the last
+  target. Send targets at least every ttl seconds; blocking `go_to` / `go_rest` are exempt; `robot.expired` counts expiries.
+* `allow_speed_override=False` (`robot.allow_speed_override: false`): refuse every per-command `speed`. In any case a `speed` above
+  `max_joint_speed` is refused, by `send_action`, `send_tcp_pose` and `go_to`; a lower one is fine.
+* For a remote client the server adds a control lease on top, see [remote_control.md](remote_control.md).
 
 ## Safety, and what has not been tested
 

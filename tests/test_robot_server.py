@@ -46,7 +46,7 @@ def test_info_and_observation_round_trip(served):
             obs = c.get_observation()
             assert obs["observation.state"].shape == (7,) and obs["observation.state"].dtype == np.float32
             if mode == "none":
-                assert set(obs) == {"observation.state", "timestamp"}
+                assert set(obs) == {"observation.state", "timestamp", "frame_age_s", "state_age_s"}
             else:
                 im = obs["observation.images.cam_high"]
                 assert im.shape == (48, 64, 3) and im.dtype == np.uint8
@@ -195,3 +195,96 @@ def test_the_client_module_does_not_pull_in_robot_code():
     code = "import sys, piper_teleop.robot_client; print(sorted(m for m in ('piper_teleop.robot', 'piper_teleop.arm', 'piper_teleop.config') if m in sys.modules))"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
     assert out.stdout.strip() == "[]", out.stdout + out.stderr
+
+
+# ------------------------------------------------------------------- control lease / keepalive
+def lease_server(lease_s):
+    robot = PiperRobot("left", sim=True, cameras=False).connect()
+    return robot, RobotServer(robot, "127.0.0.1", 0, log=lambda *_: None, lease_s=lease_s).start()
+
+
+def test_a_silent_controller_loses_control_and_the_arm_holds():
+    robot, srv = lease_server(0.3)
+    try:
+        with PiperClient("127.0.0.1", srv.port) as c:
+            a = np.zeros(7)
+            a[1] = 0.9
+            c.send_action(a, speed=0.5)
+            time.sleep(0.7)                                                         # goes quiet for > lease_s
+            assert srv.controller is None and srv.lease_revoked == 1
+            q = robot.commanded_q.copy()
+            time.sleep(0.4)
+            assert np.allclose(robot.commanded_q, q, atol=1e-6) and q[1] < 0.8      # held, did not reach 0.9
+            with pytest.raises(PermissionError, match="lease expired"):
+                c.send_action(a)
+            assert c.get_state()["lease_revoked"] == 1 and c.state.shape == (7,)    # reads still work, connection still open
+            c.acquire()                                                             # takes control back explicitly
+            c.send_action(np.zeros(7))
+    finally:
+        srv.stop()
+        robot.close()
+
+
+def test_keepalive_and_active_commands_hold_the_lease_and_blocking_moves_are_not_stalls():
+    robot, srv = lease_server(0.4)
+    try:
+        with PiperClient("127.0.0.1", srv.port) as c:
+            for _ in range(12):                                                     # 1.2 s of keepalives, 3x the lease
+                assert c.keepalive() == pytest.approx(0.4)
+                time.sleep(0.1)
+            assert srv.controller is not None and srv.lease_revoked == 0
+            c.go_to(np.radians([30, 40, -40, 20, 30, 20]), speed=0.5, timeout=20)   # ~1.4 s blocking > lease_s: not a stall
+            assert srv.lease_revoked == 0 and srv.controller is not None
+            c.go_rest()
+            assert srv.lease_revoked == 0
+    finally:
+        srv.stop()
+        robot.close()
+
+
+def test_without_a_lease_keepalive_is_harmless_and_info_reports_the_policy():
+    robot = PiperRobot("left", sim=True, cameras=False, command_ttl_s=1.5, allow_speed_override=False).connect()
+    srv = RobotServer(robot, "127.0.0.1", 0, log=lambda *_: None).start()
+    try:
+        with PiperClient("127.0.0.1", srv.port) as c:
+            assert c.keepalive() is None
+            assert c.info["command_ttl_s"] == 1.5 and c.info["lease_s"] is None and c.info["allow_speed_override"] is False
+            assert "review_patch" not in c.info
+            st = c.get_state()
+            assert st["expired"] == 0 and st["lease_revoked"] == 0 and 0.0 <= st["target_age_s"] < 60
+            with pytest.raises(ValueError, match="allow_speed_override"):
+                c.send_action(np.zeros(7), speed=0.2)
+            with pytest.raises(ValueError, match="allow_speed_override"):
+                c.go_to(np.zeros(6), speed=0.2)
+    finally:
+        srv.stop()
+        robot.close()
+
+
+def test_a_client_cannot_exceed_the_speed_cap_through_go_to_and_lease_is_validated():
+    robot = PiperRobot("left", sim=True, cameras=False, max_joint_speed=1.0).connect()
+    srv = RobotServer(robot, "127.0.0.1", 0, log=lambda *_: None).start()
+    try:
+        with PiperClient("127.0.0.1", srv.port) as c:
+            with pytest.raises(ValueError, match="above the configured cap"):
+                c.go_to(np.zeros(6), speed=5.0)
+            with pytest.raises(ValueError, match="above the configured cap"):
+                c.send_action(np.zeros(7), speed=5.0)
+        for bad in (0.01, 100.0):
+            with pytest.raises(ValueError, match="lease_s"):
+                RobotServer(robot, "127.0.0.1", 0, lease_s=bad)
+    finally:
+        srv.stop()
+        robot.close()
+
+
+def test_observation_carries_frame_and_state_ages_through_the_server():
+    robot = PiperRobot("left", sim=True, cameras="fake").connect()
+    srv = RobotServer(robot, "127.0.0.1", 0, log=lambda *_: None).start()
+    try:
+        with PiperClient("127.0.0.1", srv.port) as c:
+            obs = c.get_observation()
+            assert set(obs["frame_age_s"]) == {"cam_high"} and obs["state_age_s"] < 0.2
+    finally:
+        srv.stop()
+        robot.close()

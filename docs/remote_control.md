@@ -41,8 +41,8 @@ answered in order, one at a time. A bad request gets an error reply and the conn
 |---|---|---|
 | `hello` | | `token` -> `{protocol}`. **First message when the server has a token** (every other op is refused until then) |
 | `info` | | -> `arm, sim, state_names, camera_names, image_shapes {cam: [h, w]}, joint_lo, joint_hi, gripper_max_m, rest_q, max_joint_speed, sync_speed, rest_speed, workspace, you_control, controller_present` |
-| `state` | | -> `state` (7), `commanded_q` (6), `tcp {p, R}`, `synced`, `loop_hz`, `stale_frames`, `you_control`, `timestamp` (cheap, no images) |
-| `get_observation` | | `images`: `"jpeg"` (default) / `"raw"` / `"none"`, `quality` (JPEG, 90) -> `state` (7), `images {cam: {w, h, format, data}}`, `timestamp`. `data` is base64: a JPEG, or `raw_rgb8` = h*w*3 bytes, row-major RGB |
+| `state` | | -> `state` (7), `commanded_q` (6), `tcp {p, R}`, `synced`, `loop_hz`, `stale_frames`, `you_control`, `timestamp`, `target_age_s` (age of the current target), `expired` (targets replaced by hold, see below), `lease_revoked` (cheap, no images) |
+| `get_observation` | | `images`: `"jpeg"` (default) / `"raw"` / `"none"`, `quality` (JPEG, 90) -> `state` (7), `images {cam: {w, h, format, data}}`, `timestamp`, `frame_age_s {cam: s}` (age of each camera frame when read), `state_age_s` (age of the arm feedback), `stale_frames`. `data` is base64: a JPEG, or `raw_rgb8` = h*w*3 bytes, row-major RGB |
 | `acquire` / `release` | | take / give back control (see below) |
 | `send_action` | yes | `action` (7: joints 1..6 [rad], gripper 0..1), optional `speed` [rad/s] -> `{}` immediately; the arm moves there at the speed cap |
 | `send_tcp_pose` | yes | `position` (3, m, arm base frame: x forward, y left, z up), `rotation` (null = keep / `"free"` = position only / 3x3 / quaternion xyzw), optional `gripper`, `speed` -> `q` (6) |
@@ -50,6 +50,7 @@ answered in order, one at a time. A bad request gets an error reply and the conn
 | `go_rest` | yes | optional `gripper`, `timeout` (40 s) -> blocks until at the folded rest pose |
 | `hold` | **no** | stop where it is (the target becomes the current commanded pose) |
 | `cancel_moves` | **no** | abort a blocking `go_to` / `go_rest` and hold |
+| `keepalive` | yes | -> `lease_s` (null if the server has no lease). Counts as activity for the control lease below; changes nothing else |
 | `ping` | | -> `time` |
 
 Errors: `ValueError` (bad or missing field, outside the workspace box, ...), `IKError` (pose not reachable, or needs a joint to swing
@@ -64,6 +65,17 @@ more than 57 deg), `TimeoutError` (`go_to` did not arrive), `PermissionError` (n
   even while the controller is in a blocking move.
 * **A vanished controller stops the arm**: when the controlling client disconnects, or its connection dies (ping timeout ~10 s), the
   arm holds where it is and the lease is freed.
+* **Optional: a control lease** (`--lease-s S`, or `robot.lease_s`; off by default). The controlling client must send a control op
+  (`send_action`, `go_to`, `keepalive` ...) at least every S seconds, otherwise the server **revokes control and the arm holds**. The
+  connection stays open, nothing resumes by itself, and the next command raises `PermissionError` ("lease expired"): call `acquire`
+  again. A blocking `go_to` / `go_rest` is never counted as a stall. Use it when a client may hang (a slow model, a laptop that sleeps)
+  while connected; `ping` and the read ops do not count as activity, `keepalive` does.
+* **Optional: command expiry** (`--command-ttl-s S`, or `robot.command_ttl_s`; off by default). A target older than S seconds is
+  replaced by "hold where commanded now", so a client that stops sending commands stops the arm even in the middle of a slow
+  approach: send targets at least every S seconds. Blocking `go_to` / `go_rest` moves are exempt. `expired` in `state` counts these.
+* **Speed policy.** A per-command `speed` may only *lower* the speed: anything above `robot.max_joint_speed` is refused (for
+  `send_action`, `send_tcp_pose` and `go_to` alike), and `--forbid-speed-override` / `robot.allow_speed_override: false` refuses every
+  per-command speed so the configured cap is all that applies.
 * **Same safety as local control**: joint limits, the speed cap (`robot.max_joint_speed`, 2 rad/s), the workspace box for tool-pose
   targets, the joint lock. The motors are never disabled.
 * **Network**: it listens on `127.0.0.1` by default. A non-local `--host` is refused without `--token` (or `PIPER_TOKEN`) unless you pass

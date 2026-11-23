@@ -26,7 +26,8 @@ def wait_until(cond, timeout=6.0):
 def test_observation_has_the_datasets_keys_units_and_names():
     with make(cameras="fake") as r:
         obs = r.get_observation()
-        assert set(obs) == {"observation.state", "observation.images.cam_high", "timestamp"}
+        assert set(obs) == {"observation.state", "observation.images.cam_high", "timestamp", "frame_age_s", "state_age_s"}
+        assert set(obs["frame_age_s"]) == {"cam_high"} and 0.0 <= obs["frame_age_s"]["cam_high"] < 0.2 and 0.0 <= obs["state_age_s"] < 0.1
         s = obs["observation.state"]
         assert s.shape == (7,) and s.dtype == np.float32 and 0.0 <= s[6] <= 1.0
         img = obs["observation.images.cam_high"]
@@ -44,6 +45,20 @@ def test_camera_sets_resolve_like_the_recorder_and_unknown_ones_are_refused():
         PiperRobot("left", sim=True, cameras="nope")
 
 
+def window_speeds(commands, win=0.1):
+    """Joint speed [rad/s] over every ``win``-second window of the recorded commands.  (Per-tick speed is not measurable: after a scheduling
+    stall the loop takes one catch-up step worth at most 20 ms of motion a few ms after the previous command.)"""
+    t = np.array([c[0] for c in commands])
+    q = np.array([c[1] for c in commands])
+    out = []
+    for i in range(len(t)):
+        k = int(np.searchsorted(t, t[i] + win))
+        if k >= len(t):
+            break
+        out.append(float(np.max(np.abs(q[k] - q[i]))) / (t[k] - t[i]))
+    return np.array(out)
+
+
 def test_first_target_is_approached_slowly_then_the_speed_cap_applies():
     with make(max_joint_speed=2.0, sync_speed=0.5) as r:
         r.backend.record = True
@@ -51,17 +66,15 @@ def test_first_target_is_approached_slowly_then_the_speed_cap_applies():
         a[1] = np.radians(40)
         r.send_action(a)
         wait_until(lambda: r.synced and abs(r.state[1] - a[1]) < 0.02, 8.0)
-        t, q = zip(*[(c[0], c[1]) for c in r.backend.commands])
-        v = np.max(np.abs(np.diff(np.array(q), axis=0)), axis=1) / np.maximum(np.diff(t), 1e-6)
-        assert np.median(v[v > 0.05]) <= 0.55 and v.max() < 0.8                     # sync speed 0.5 rad/s, not the 2.0 cap
+        v = window_speeds(r.backend.commands)
+        assert 0.4 < np.median(v[v > 0.05]) <= 0.55 and v.max() <= 0.5 * 1.15          # sync speed 0.5 rad/s, not the 2.0 cap
         r.backend.commands.clear()
         b = a.copy()
         b[1] = np.radians(5)
         r.send_action(b)
         wait_until(lambda: abs(r.state[1] - b[1]) < 0.02, 8.0)
-        t, q = zip(*[(c[0], c[1]) for c in r.backend.commands])
-        v = np.max(np.abs(np.diff(np.array(q), axis=0)), axis=1) / np.maximum(np.diff(t), 1e-6)
-        assert 1.0 < np.percentile(v, 90) <= 2.2                                    # now the 2.0 rad/s cap
+        v = window_speeds(r.backend.commands)
+        assert v.max() > 1.0 and v.max() <= 2.0 * 1.15                                  # now the 2.0 rad/s cap
 
 
 def test_send_action_validates_and_clips_to_the_joint_limits():
@@ -111,7 +124,7 @@ def test_reset_go_to_timeout_and_cancel():
 def test_close_folds_to_rest_and_never_disables_the_motors(monkeypatch):
     r = make().connect()
     monkeypatch.setattr(r.backend, "disable", lambda: (_ for _ in ()).throw(AssertionError("motors must never be disabled")))
-    r.go_to(np.radians([30, 30, -30, 0, 20, 0]), speed=3.0)
+    r.go_to(np.radians([30, 30, -30, 0, 20, 0]), speed=2.0)
     r.close()
     assert np.allclose(r.backend._q, 0.0, atol=0.03) and r.backend._enabled and not r.connected
     r.close()                                                                       # twice is fine
@@ -120,7 +133,7 @@ def test_close_folds_to_rest_and_never_disables_the_motors(monkeypatch):
 def test_park_on_exit_false_just_holds():
     with make(park_on_exit=False) as r:
         q = np.radians([30, 30, -30, 0, 20, 0])
-        r.go_to(q, speed=3.0)
+        r.go_to(q, speed=2.0)
     assert np.allclose(r.backend._q, q, atol=0.05) and r.backend._enabled
 
 
@@ -242,3 +255,67 @@ def test_run_policy_cli_end_to_end_in_sim(capsys):
         rp.main(["--policy", "nocolon", "--sim"])
     with pytest.raises(SystemExit, match="no 'nope'"):
         rp.main(["--policy", f"{EXAMPLES}:nope", "--sim"])
+
+
+# ------------------------------------------------------------ command freshness / speed policy
+def test_a_stale_target_is_replaced_by_hold_but_only_when_ttl_is_set():
+    with make(command_ttl_s=0.3) as r:
+        a = np.zeros(7)
+        a[1] = 0.9
+        r.send_action(a, speed=0.5)                                                 # a slow 1.8 s approach...
+        time.sleep(0.9)                                                             # ...but the client goes quiet
+        q = r.commanded_q.copy()
+        time.sleep(0.5)
+        assert r.expired >= 1 and np.allclose(r.commanded_q, q, atol=1e-6) and 0.05 < q[1] < 0.8   # stopped part-way, held
+        assert r._tgt_q[1] == pytest.approx(q[1], abs=1e-6)
+    with make() as r:                                                               # no ttl: it keeps going to the target
+        a = np.zeros(7)
+        a[1] = 0.5
+        r.send_action(a, speed=2.0)
+        wait_until(lambda: abs(r.state[1] - 0.5) < 0.02)
+        assert r.expired == 0
+
+
+def test_a_client_that_keeps_sending_is_never_expired_and_blocking_moves_are_exempt():
+    with make(command_ttl_s=0.3, sync_speed=2.0) as r:
+        for i in range(12):                                                         # a fresh target every 0.1 s
+            a = np.zeros(7)
+            a[1] = 0.05 * (i + 1)
+            r.send_action(a)
+            time.sleep(0.1)
+        assert r.expired == 0 and r.commanded_q[1] > 0.4
+        r.go_to(np.radians([20, 40, -40, 10, 20, 10]), speed=0.5)                   # takes ~1.5 s, ttl is 0.3 s: exempt
+        assert np.allclose(r.state[:6], np.radians([20, 40, -40, 10, 20, 10]), atol=0.03) and r.expired == 0
+
+
+def test_speeds_above_the_cap_are_refused_everywhere_including_go_to():
+    with make(max_joint_speed=1.0) as r:
+        a = np.zeros(7)
+        for call in (lambda: r.send_action(a, speed=1.5), lambda: r.go_to(np.zeros(6), speed=1.5),
+                     lambda: r.send_tcp_pose(r.tcp_pose()[1] + [0.01, 0, 0.01], "free", speed=1.5)):
+            with pytest.raises(ValueError, match="above the configured cap"):
+                call()
+        assert not r._moving and not r._have_target                                 # a refused call changes nothing
+        r.send_action(a, speed=0.5)                                                 # lowering the speed is fine
+        r.go_to(np.zeros(6), speed=1.0)                                             # exactly the cap is fine
+    with make(allow_speed_override=False) as r:
+        with pytest.raises(ValueError, match="allow_speed_override"):
+            r.send_action(np.zeros(7), speed=0.1)
+        with pytest.raises(ValueError, match="allow_speed_override"):
+            r.go_to(np.zeros(6), speed=0.1)
+        r.send_action(np.zeros(7))                                                  # the configured cap still applies
+        r.go_to(np.zeros(6))                                                        # default rest_speed
+
+
+def test_ttl_is_validated_and_comes_from_the_config():
+    for bad in (0.0, -1.0, 100.0):
+        with pytest.raises(ValueError, match="command_ttl_s"):
+            PiperRobot("left", sim=True, cameras=False, command_ttl_s=bad)
+    from piper_teleop import config as C
+    raw = C.load()
+    raw["robot"]["command_ttl_s"] = 0.25
+    raw["robot"]["allow_speed_override"] = False
+    r = PiperRobot("left", sim=True, cameras=False, config=raw)
+    assert r.command_ttl_s == 0.25 and r.allow_speed_override is False
+    shipped = PiperRobot("left", sim=True, cameras=False)
+    assert shipped.command_ttl_s is None and shipped.allow_speed_override is True   # shipped defaults change nothing

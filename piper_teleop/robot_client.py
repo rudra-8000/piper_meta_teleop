@@ -8,7 +8,8 @@
 
 Connecting takes CONTROL of the arm (only one client controls at a time; ``control=False`` connects read-only).  Calls are
 synchronous: each sends one request and waits for its reply.  Errors on the server come back as the same Python exceptions
-(``ValueError``, ``IKError``, ``TimeoutError``, ``PermissionError``...).  Closing releases control and the arm holds where it is.
+(``ValueError``, ``IKError``, ``TimeoutError``, ``PermissionError``...); if the server has a control lease and you went quiet
+for longer than it, control is revoked (the arm holds) and the next command raises ``PermissionError`` - ``acquire()`` again.  Closing releases control and the arm holds where it is.
 It needs only numpy, Pillow and websockets - no robot code runs on the client machine.
 
 Command line (handy for checking a server or stopping it from another terminal):
@@ -123,6 +124,8 @@ class PiperClient:
                 arr = np.frombuffer(data, np.uint8).reshape(im["h"], im["w"], 3).copy()
             obs[f"observation.images.{name}"] = arr
         obs["timestamp"] = r["timestamp"]
+        if "frame_age_s" in r:                                      # how old each camera frame / the arm feedback was when read
+            obs["frame_age_s"], obs["state_age_s"] = r["frame_age_s"], r.get("state_age_s")
         return obs
 
     def get_state(self) -> dict:
@@ -178,6 +181,11 @@ class PiperClient:
 
     def go_rest(self, gripper: float | None = None, **kw):
         self._call("go_rest", gripper=gripper, **kw)
+
+    def keepalive(self) -> float | None:
+        """Tell the server this controller is alive (needed only when the server runs with a control lease and you are not sending
+        commands for a while).  Returns the lease length in seconds, or None if the server has no lease."""
+        return self._call("keepalive").get("lease_s")
 
     def hold(self):
         self._call("hold")

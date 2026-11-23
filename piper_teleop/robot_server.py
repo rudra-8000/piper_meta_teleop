@@ -62,8 +62,17 @@ class RobotServer:
     """Serve one ``PiperRobot`` over WebSocket.  ``start()`` runs it in a background thread (``port=0`` picks a free port: read
     ``server.port``); ``stop()`` stops it (the robot is NOT closed - you own that)."""
 
-    def __init__(self, robot: PiperRobot, host: str = "127.0.0.1", port: int = 8800, token: str | None = None, log=print):
+    def __init__(self, robot: PiperRobot, host: str = "127.0.0.1", port: int = 8800, token: str | None = None, log=print,
+                 lease_s: float | None = None):
         self.robot, self.host, self.port, self.token, self.log = robot, host, port, token or None, log
+        # Control lease (stalled controller): the controlling client must send a control op (send_action / keepalive / ...) within lease_s, else
+        #     the server revokes control and holds; it does NOT close the connection and nothing resumes automatically
+        if lease_s is not None and not 0.1 <= float(lease_s) <= 60.0:
+            raise ValueError(f"lease_s must be in [0.1, 60] s or None, got {lease_s}")
+        self.lease_s = None if lease_s is None else float(lease_s)
+        self._last_activity = time.monotonic()
+        self._busy = 0                                   # control ops in flight (a blocking go_to / go_rest must not look like a stalled controller)
+        self.lease_revoked = 0
         self.controller: _Conn | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -73,8 +82,8 @@ class RobotServer:
         self.ops = {"ping": self._ping, "info": self._info, "state": self._state, "get_observation": self._get_observation,
                     "acquire": self._acquire, "release": self._release, "hold": self._hold, "cancel_moves": self._cancel,
                     "send_action": self._send_action, "send_tcp_pose": self._send_tcp_pose, "go_to": self._go_to,
-                    "go_rest": self._go_rest}
-        self.needs_control = {"send_action", "send_tcp_pose", "go_to", "go_rest"}
+                    "go_rest": self._go_rest, "keepalive": self._keepalive}
+        self.needs_control = {"send_action", "send_tcp_pose", "go_to", "go_rest", "keepalive"}
 
     # --------------------------------------------------------------- lifecycle
     def start(self) -> "RobotServer":
@@ -97,10 +106,21 @@ class RobotServer:
             async with serve(self._handler, self.host, self.port, max_size=MAX_MESSAGE, ping_interval=5, ping_timeout=5) as srv:
                 self.port = srv.sockets[0].getsockname()[1]
                 self._ready.set()
+                dog = asyncio.create_task(self._lease_watchdog())
                 await self._stop.wait()
+                dog.cancel()
         except BaseException as e:                                  # noqa: BLE001  (port in use ...): report to start()
             self._error = e
             self._ready.set()
+
+    async def _lease_watchdog(self):
+        while True:
+            await asyncio.sleep(0.05)
+            if self.lease_s is not None and self.controller is not None and self._busy == 0 and time.monotonic() - self._last_activity > self.lease_s:
+                old, self.controller = self.controller, None
+                self.lease_revoked += 1
+                await asyncio.to_thread(self.robot.hold)
+                self.log(f"[server] control lease expired for {old.peer} (no control op for {self.lease_s:g} s) - control revoked, the arm holds its pose")
 
     # ----------------------------------------------------------------- session
     async def _handler(self, ws):
@@ -142,8 +162,16 @@ class RobotServer:
             if op not in self.ops:
                 raise ValueError(f"unknown op {op!r}; ops: {sorted(self.ops)} + hello")
             if op in self.needs_control and self.controller is not conn:
-                raise PermissionError('not in control: send {"op": "acquire"} first (only one client controls the arm at a time)')
-            out = await self.ops[op](conn, req)
+                raise PermissionError('not in control (never acquired, released, or the control lease expired): send {"op": "acquire"} first (only one client controls the arm at a time)')
+            if op in self.needs_control:
+                self._last_activity = time.monotonic()
+                self._busy += 1
+                try: out = await self.ops[op](conn, req)
+                finally:
+                    self._busy -= 1
+                    self._last_activity = time.monotonic()
+            else:
+                out = await self.ops[op](conn, req)
             return {"ok": True, "id": rid, **(out or {})}
         except Exception as e:                                       # noqa: BLE001  every failure becomes a reply, never a crash
             if isinstance(e, KeyError):
@@ -169,7 +197,8 @@ class RobotServer:
                 "image_shapes": {n: [c.height, c.width] for n, c in r.cameras.items()},
                 "joint_lo": JOINT_LO.tolist(), "joint_hi": JOINT_HI.tolist(), "gripper_max_m": GRIPPER_MAX_M,
                 "rest_q": r.rest_q.tolist(), "max_joint_speed": r.max_joint_speed, "sync_speed": r.sync_speed,
-                "rest_speed": r.rest_speed, "control_hz": r.control_hz, "you_control": self.controller is conn,
+                "rest_speed": r.rest_speed, "control_hz": r.control_hz, "command_ttl_s": r.command_ttl_s, "lease_s": self.lease_s,
+                "allow_speed_override": r.allow_speed_override, "you_control": self.controller is conn,
                 "controller_present": self.controller is not None,
                 "workspace": {k: list(v) for k, v in r.acfg.workspace.items()}}
 
@@ -178,7 +207,7 @@ class RobotServer:
         R, p = r.tcp_pose()
         return {"state": r.state.tolist(), "commanded_q": r.commanded_q.tolist(), "tcp": {"p": p.tolist(), "R": R.tolist()},
                 "synced": r.synced, "loop_hz": r.loop_hz, "stale_frames": dict(r.stale_frames), "you_control": self.controller is conn,
-                "timestamp": time.time()}
+                "timestamp": time.time(), "target_age_s": time.monotonic() - r._tgt_t, "expired": r.expired, "lease_revoked": self.lease_revoked}
 
     async def _get_observation(self, conn, req):
         mode = req.get("images", "jpeg")
@@ -190,12 +219,14 @@ class RobotServer:
             for k, v in obs.items():
                 if k.startswith("observation.images."):
                     images[k[len("observation.images."):]] = await asyncio.to_thread(encode_image, v, mode, req.get("quality", 90))
-        return {"state": obs["observation.state"].tolist(), "images": images, "timestamp": obs["timestamp"]}
+        return {"state": obs["observation.state"].tolist(), "images": images, "timestamp": obs["timestamp"],
+                "frame_age_s": obs.get("frame_age_s", {}), "state_age_s": obs.get("state_age_s"), "stale_frames": dict(self.robot.stale_frames)}
 
     async def _acquire(self, conn, req):
         if self.controller is not None and self.controller is not conn:
             raise PermissionError(f"another client ({self.controller.peer}) already controls the arm")
         self.controller = conn
+        self._last_activity = time.monotonic()
         self.log(f"[server] {conn.peer} has control")
         return {"you_control": True}
 
@@ -214,6 +245,9 @@ class RobotServer:
         self.robot.cancel_moves()
         await asyncio.to_thread(self.robot.hold)
         return {}
+
+    async def _keepalive(self, conn, req):
+        return {"lease_s": self.lease_s}
 
     async def _send_action(self, conn, req):
         self.robot.send_action(self._vec(req, "action", 7), speed=req.get("speed"))
@@ -247,6 +281,9 @@ def main(argv=None) -> int:
     ap.add_argument("--insecure", action="store_true", help="allow a non-local --host WITHOUT a token (anyone on the network can move the arm)")
     ap.add_argument("--max-joint-speed", type=float, help="rad/s cap (default robot.max_joint_speed)")
     ap.add_argument("--no-park", action="store_true", help="do not fold to rest when the server stops (the arm just holds)")
+    ap.add_argument("--command-ttl-s", type=float, help="a target older than this many seconds is replaced by hold, so a client that stops sending stops the arm (default: robot.command_ttl_s, off)")
+    ap.add_argument("--lease-s", type=float, help="the controller must send a control op (send_action, keepalive...) within this many seconds or control is revoked and the arm holds (default: robot.lease_s, off)")
+    ap.add_argument("--forbid-speed-override", action="store_true", help="refuse every per-command speed (default: robot.allow_speed_override, true)")
     ap.add_argument("--config")
     a = ap.parse_args(argv)
 
@@ -258,7 +295,8 @@ def main(argv=None) -> int:
                          "the arm. Pass --token SECRET, or --insecure if you really mean it.")
     cams = False if a.no_cameras else a.cameras
     robot = PiperRobot(a.arm, sim=a.sim, cameras=cams, config=a.config, max_joint_speed=a.max_joint_speed,
-                       park_on_exit=False if a.no_park else None)
+                       park_on_exit=False if a.no_park else None, command_ttl_s=a.command_ttl_s,
+                       allow_speed_override=False if a.forbid_speed_override else None)
     stop = threading.Event()
     n = {"c": 0}
 
@@ -273,7 +311,8 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, on_sigint)
     signal.signal(signal.SIGTERM, on_sigint)
     robot.connect()
-    server = RobotServer(robot, host, port, a.token).start()
+    lease = a.lease_s if a.lease_s is not None else rc.get("lease_s")
+    server = RobotServer(robot, host, port, a.token, lease_s=lease).start()
     print(f"[server] {robot.arm} arm{' (sim)' if a.sim else ''} ready on ws://{host}:{server.port}  "
           f"cameras {robot.camera_names or 'none'}  token {'required' if a.token else 'none'}\n"
           "[server] the arm moves only when a client with control commands it; Ctrl-C stops (folds to rest, motors stay enabled).", flush=True)

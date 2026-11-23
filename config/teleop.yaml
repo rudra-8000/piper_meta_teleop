@@ -124,6 +124,11 @@ robot:
   rest_deg: null                 # null = defaults.park_deg, the folded rest pose every recorded episode starts from
   server_host: 127.0.0.1         # python -m piper_teleop.robot_server: 127.0.0.1 = this machine only; a network address needs --token
   server_port: 8800
+  command_ttl_s: null            # null = off.  Seconds: a target older than this is replaced by "hold", so a client / policy that stops sending
+                                 #   commands stops the arm (even mid-approach: send at least every ttl s).  A blocking go_to / go_rest is exempt
+  lease_s: null                  # robot_server only, null = off.  The controlling client must send a control op (send_action, keepalive...) within
+                                 #   this many seconds or control is revoked and the arm holds; it must `acquire` again
+  allow_speed_override: true     # false = refuse every per-command `speed` (the cap above is all that applies).  Above max_joint_speed is always refused
   park_on_exit: true             # fold to rest when the program ends; the motors always stay ENABLED and holding
   # gripper input layer (target + slow sine): leader_follower.gripper_slew_mm_s / _dither_mm / _dither_hz, same as the teleop
 

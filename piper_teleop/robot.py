@@ -78,7 +78,8 @@ class PiperRobot:
 
     def __init__(self, arm: str | None = None, *, sim: bool = False, cameras=None, config=None,
                  max_joint_speed: float | None = None, sync_speed: float | None = None, rest_speed: float | None = None,
-                 control_hz: float | None = None, park_on_exit: bool | None = None):
+                 control_hz: float | None = None, park_on_exit: bool | None = None,
+                 command_ttl_s: float | None = None, allow_speed_override: bool | None = None):
         self.raw = config if isinstance(config, dict) else cfgmod.load(config)
         rc = self.raw.get("robot", {})
         lfc = self.raw.get("leader_follower", {})
@@ -89,6 +90,14 @@ class PiperRobot:
         self.sync_speed = pick(sync_speed, "sync_speed", 0.5)
         self.rest_speed = pick(rest_speed, "rest_speed", 0.5)
         self.control_hz = pick(control_hz, "control_hz", 200.0)
+        # Command freshness: a target older than command_ttl_s is replaced by "hold where commanded" in the control tick (so a client that
+        # stops sending commands stops the arm, even mid-approach: send targets at least every ttl seconds);
+        #     allow_speed_override=False refuses per-command speeds, and speeds above max_joint_speed are always refused
+        ttl = command_ttl_s if command_ttl_s is not None else rc.get("command_ttl_s")
+        if ttl is not None and not 0.0 < float(ttl) <= 60.0:
+            raise ValueError(f"command_ttl_s must be in (0, 60] s or None, got {ttl}")
+        self.command_ttl_s = None if ttl is None else float(ttl)
+        self.allow_speed_override = bool(rc.get("allow_speed_override", True) if allow_speed_override is None else allow_speed_override)
         self.park_on_exit = bool(rc.get("park_on_exit", True) if park_on_exit is None else park_on_exit)
         for name, v in (("max_joint_speed", self.max_joint_speed), ("sync_speed", self.sync_speed), ("rest_speed", self.rest_speed)):
             if not 0.0 < v <= 6.0:
@@ -117,6 +126,10 @@ class PiperRobot:
         self.connected = False
         self.stale_frames = {}                 # camera name -> number of observations that used a frame older than 0.15 s
         self.loop_hz = 0.0
+        self._tgt_t = time.monotonic()         # when the current target was set (command freshness)
+        self._moving = False                   # a blocking go_to / go_rest is in progress: exempt from the command expiry
+        self.expired = 0                       # number of targets replaced by "hold" because they were older than command_ttl_s
+        self._state_t = 0.0                    # wall time of the latest feedback read in the control loop
 
     # ------------------------------------------------------------------ setup
     def _camera_specs(self, cameras) -> dict:
@@ -199,7 +212,13 @@ class PiperRobot:
 
     def _tick(self, dt: float):
         st = self.backend.read()
+        self._state_t = time.time()
         with self._lock:
+            if (self.command_ttl_s is not None and self._have_target and not self._moving
+                    and time.monotonic() - self._tgt_t > self.command_ttl_s and float(np.max(np.abs(self._tgt_q - self._q_cmd))) > 1e-9):
+                self._tgt_q = self._q_cmd.copy()               # stale target: stop where commanded now (the gripper target is kept)
+                self._speed = None
+                self.expired += 1
             tgt_q, tgt_g, speed = self._tgt_q.copy(), self._tgt_g, self._speed
         err = tgt_q - self._q_cmd
         m = float(np.max(np.abs(err)))
@@ -233,6 +252,8 @@ class PiperRobot:
             if cam.frame_age() > 0.15:
                 self.stale_frames[name] += 1
         obs["timestamp"] = time.time()
+        obs["frame_age_s"] = {name: float(cam.frame_age()) for name, cam in self.cameras.items()}      # age of each camera frame at read time [s]
+        obs["state_age_s"] = (time.time() - self._state_t) if self._state_t else float("inf")
         return obs
 
     @property
@@ -259,7 +280,20 @@ class PiperRobot:
     # ------------------------------------------------------------------ action
     def send_action(self, action, *, speed: float | None = None):
         """Set the target: ``action`` = (7,) absolute joint targets [rad] + gripper 0..1 (the dataset's ``action``).  Returns at
-        once; the control thread moves the arm there at the speed cap.  ``speed`` (rad/s) overrides the cap for this target."""
+        once; the control thread moves the arm there at the speed cap.  ``speed`` (rad/s) may only LOWER the speed for this target:
+        anything above ``max_joint_speed`` is refused (and every per-command speed is, if ``allow_speed_override`` is false)."""
+        self._check_speed(speed)
+        self._set_target(action, speed)
+
+    def _check_speed(self, speed):
+        if speed is None:
+            return
+        if not self.allow_speed_override:
+            raise ValueError("a per-command speed is refused (robot.allow_speed_override is false): the configured cap applies")
+        if speed > self.max_joint_speed:
+            raise ValueError(f"a per-command speed above the configured cap max_joint_speed={self.max_joint_speed:g} rad/s is refused, got {speed}")
+
+    def _set_target(self, action, speed):
         self._check()
         a = np.asarray(action, dtype=float).reshape(-1)
         if a.shape != (7,) or not np.all(np.isfinite(a)):
@@ -271,6 +305,7 @@ class PiperRobot:
             self._tgt_g = float(np.clip(a[6], 0.0, 1.0))
             self._speed = speed
             self._have_target = True
+            self._tgt_t = time.monotonic()
 
     def run_chunk(self, actions, hz: float = 30.0, on_step=None):
         """Execute a (N, 7) action chunk open-loop at ``hz``; blocks for N / hz seconds.  ``on_step(i)`` is called before each."""
@@ -289,18 +324,21 @@ class PiperRobot:
         with self._lock:
             self._tgt_q = self._q_cmd.copy()
             self._speed = None
+            self._tgt_t = time.monotonic()
 
     def go_to(self, q, gripper: float | None = None, *, speed: float | None = None, timeout: float = 30.0, tol_deg: float = 1.5):
         """Blocking joint-space move at ``speed`` (default ``rest_speed``): all joints arrive together.  Raises TimeoutError if the
         arm is not there after ``timeout`` s - it stays enabled and holding."""
         self._check()
+        self._check_speed(speed)                                   # a blocking move obeys the same cap as send_action
         q = np.clip(np.asarray(q, float).reshape(6), JOINT_LO, JOINT_HI)
         g = self._tgt_g if gripper is None else float(gripper)
         self._cancel.clear()
-        self.send_action(np.append(q, g), speed=speed or self.rest_speed)
         tol = math.radians(tol_deg)
         t0 = time.monotonic()
+        self._moving = True                    # set INSIDE the try so a refused target can never leave the expiry disabled
         try:
+            self._set_target(np.append(q, g), speed or self.rest_speed)
             while True:
                 self._check()
                 if self._cancel.is_set():
@@ -313,8 +351,10 @@ class PiperRobot:
                                        f"(now {np.degrees(self._state.q).round(1).tolist()}); it holds its pose")
                 time.sleep(0.01)
         finally:
+            self._moving = False
             with self._lock:
                 self._speed = None
+                self._tgt_t = time.monotonic()
             self.synced = True
 
     def cancel_moves(self):
